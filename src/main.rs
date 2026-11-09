@@ -1,4 +1,10 @@
+mod boltzmann2;
+mod rbm;
+
 use peroxide::fuga::*;
+
+use boltzmann2::{data_moments, hebb_boltzmann, hinton_boltzmann};
+use rbm::{Phase, train_rbm};
 
 /// Spin values: +1 (up) and -1 (down).
 const UP: f64 = 1.0;
@@ -12,6 +18,17 @@ const ALL_STATES: [State; 4] = [(UP, UP), (UP, DOWN), (DOWN, UP), (DOWN, DOWN)];
 /// Target distribution over ALL_STATES = [(+,+), (+,-), (-,+), (-,-)], proportional to (4, 1, 1, 4).
 const TARGET: [f64; 4] = [0.4, 0.1, 0.1, 0.4];
 
+/// A distribution over the two visible spins, P(x) = exp(-E(x)) / Z.
+/// For the RBM, E is the free energy obtained by summing out the hidden units.
+trait SpinModel {
+    fn energy(&self, x: State) -> f64;
+    fn log_z(&self) -> f64;
+
+    fn prob(&self, x: State) -> f64 {
+        (-self.energy(x) - self.log_z()).exp()
+    }
+}
+
 fn main() {
     let data = sample_states(&TARGET, 100, 42);
     let counts = ALL_STATES.map(|x| data.iter().filter(|&&d| d == x).count());
@@ -20,24 +37,59 @@ fn main() {
 
     let hebb = hebb_boltzmann(&data);
     let hinton = hinton_boltzmann(&data, 0.5, 500);
-    println!("Hebb:   {hebb:?}");
-    println!("Hinton: {hinton:?}");
+    let rbm_exact = train_rbm::<1>(&data, Phase::Exact, 0.1, 3000, 7);
+    let rbm_cd = train_rbm::<1>(&data, Phase::Cd(1), 0.1, 3000, 7);
+    println!("Hebb:       {hebb:?}");
+    println!("Hinton:     {hinton:?}");
+    println!("RBM exact:  {rbm_exact:?}");
+    println!("RBM CD-1:   {rbm_cd:?}");
 
-    println!("{:>12} {:>8} {:>8} {:>8} {:>8}", "state", "target", "data", "Hebb", "Hinton");
+    let models: [(&str, &dyn SpinModel); 4] = [
+        ("hebb", &hebb),
+        ("hinton", &hinton),
+        ("rbm_exact", &rbm_exact),
+        ("rbm_cd", &rbm_cd),
+    ];
+
+    print!("{:>12} {:>8} {:>8}", "state", "target", "data");
+    models.iter().for_each(|(name, _)| print!(" {name:>10}"));
+    println!();
     for (x, t) in ALL_STATES.into_iter().zip(TARGET) {
-        println!(
-            "{:>12} {:>8.4} {:>8.4} {:>8.4} {:>8.4}",
-            format!("{x:?}"), t, empirical_prob(&data, x), hebb.prob(x), hinton.prob(x)
-        );
+        print!("{:>12} {t:>8.4} {:>8.4}", format!("{x:?}"), empirical_prob(&data, x));
+        models.iter().for_each(|(_, m)| print!(" {:>10.4}", m.prob(x)));
+        println!();
     }
-    println!("KL(data || P): Hebb = {:.2e}, Hinton = {:.2e}", kl_divergence(&data, &hebb), kl_divergence(&data, &hinton));
-    let kl_target = |m: &Boltzmann2| -> f64 {
-        ALL_STATES.iter().zip(TARGET).map(|(&x, t)| t * (t / m.prob(x)).ln()).sum()
-    };
-    println!("KL(target || P): Hebb = {:.2e}, Hinton = {:.2e}", kl_target(&hebb), kl_target(&hinton));
+    print!("{:>30}", "KL(data || P)");
+    models.iter().for_each(|(_, m)| print!(" {:>10.2e}", kl_divergence(&data, *m)));
+    println!();
+    print!("{:>30}", "KL(target || P)");
+    models.iter().for_each(|(_, m)| print!(" {:>10.2e}", kl_target(*m)));
+    println!();
 
-    write_energy_grid(&[("hebb", &hebb), ("hinton", &hinton)], 101, "data/energy_grid.parquet")
-        .expect("failed to write parquet");
+    cd_k_comparison(&data, &[1, 5, 20], &[(0.1, 3000), (0.02, 15000)], 10);
+
+    write_energy_grid(&models, 101, "data/energy_grid.parquet").expect("failed to write parquet");
+}
+
+/// KL(data || P) of RBM(H=1) fits for several CD-k, averaged over seeds.
+/// Two learning rates with the same lr * steps separate the two error sources:
+/// the gradient noise shrinks with lr, the CD bias does not depend on it.
+fn cd_k_comparison(data: &[State], ks: &[usize], schedules: &[(f64, usize)], n_seeds: u64) {
+    println!("\nCD-k vs exact, RBM(H=1), KL(data || P) mean +- sd over {n_seeds} seeds");
+    print!("{:>10}", "phase");
+    schedules.iter().for_each(|(lr, steps)| print!("   {:>22}", format!("lr={lr}, steps={steps}")));
+    println!();
+    let phases = std::iter::once(Phase::Exact).chain(ks.iter().map(|&k| Phase::Cd(k)));
+    for phase in phases {
+        print!("{:>10}", format!("{phase:?}"));
+        for &(lr, steps) in schedules {
+            let kls: Vec<f64> = (0..n_seeds)
+                .map(|s| kl_divergence(data, &train_rbm::<1>(data, phase, lr, steps, 100 + s)))
+                .collect();
+            print!("   {:>10.2e} +- {:>8.1e}", kls.mean(), kls.sd());
+        }
+        println!();
+    }
 }
 
 /// Draw n states from probabilities p over ALL_STATES by inverting the cumulative distribution
@@ -60,10 +112,10 @@ fn sample_states(p: &[f64; 4], n: usize, seed: u64) -> Vec<State> {
         .collect()
 }
 
-/// Evaluate E(x1, x2) and exp(-E)/Z of each model on an n x n grid over [-1, 1]^2 and save it as
-/// parquet with columns x1, x2, energy_<name>, prob_<name>. Only the four corners are spin
-/// states; the interior is the continuous extension of E.
-fn write_energy_grid(models: &[(&str, &Boltzmann2)], n: usize, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Evaluate -ln P(x) = E(x) + ln Z of each model on an n x n grid over [-1, 1]^2 and save it as
+/// parquet with columns x1, x2, nlp_<name>. Only the four corners are spin states; the interior is
+/// the continuous extension of the (free) energy. Adding ln Z puts all models on the same scale.
+fn write_energy_grid(models: &[(&str, &dyn SpinModel)], n: usize, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let axis = linspace(DOWN, UP, n);
     let grid: Vec<State> = axis.iter().flat_map(|&a| axis.iter().map(move |&b| (a, b))).collect();
 
@@ -71,78 +123,11 @@ fn write_energy_grid(models: &[(&str, &Boltzmann2)], n: usize, path: &str) -> Re
     df.push("x1", Series::new(grid.iter().map(|x| x.0).collect::<Vec<f64>>()));
     df.push("x2", Series::new(grid.iter().map(|x| x.1).collect::<Vec<f64>>()));
     for (name, m) in models {
-        df.push(&format!("energy_{name}"), Series::new(grid.iter().map(|&x| m.energy(x)).collect::<Vec<f64>>()));
-        df.push(&format!("prob_{name}"), Series::new(grid.iter().map(|&x| m.prob(x)).collect::<Vec<f64>>()));
+        let nlp = grid.iter().map(|&x| m.energy(x) + m.log_z()).collect::<Vec<f64>>();
+        df.push(&format!("nlp_{name}"), Series::new(nlp));
     }
     std::fs::create_dir_all("data")?;
     df.write_parquet(path, SNAPPY)
-}
-
-/// Two-spin Boltzmann machine, E(x) = -w x1 x2 - b1 x1 - b2 x2.
-/// Z is computed in the constructor, so a model with a stale Z cannot exist.
-#[derive(Debug, Clone, Copy)]
-struct Boltzmann2 {
-    w: f64,
-    b1: f64,
-    b2: f64,
-    z: f64,
-}
-
-impl Boltzmann2 {
-    fn new(w: f64, b1: f64, b2: f64) -> Self {
-        let mut m = Self { w, b1, b2, z: 0.0 };
-        m.z = ALL_STATES.iter().map(|&x| m.weight(x)).sum();
-        m
-    }
-
-    fn energy(&self, (x1, x2): State) -> f64 {
-        -self.w * x1 * x2 - self.b1 * x1 - self.b2 * x2
-    }
-
-    /// Unnormalized Boltzmann weight exp(-E).
-    fn weight(&self, x: State) -> f64 {
-        (-self.energy(x)).exp()
-    }
-
-    fn prob(&self, x: State) -> f64 {
-        self.weight(x) / self.z
-    }
-
-    /// Model averages (<x1 x2>, <x1>, <x2>), exact by summing over all states.
-    fn moments(&self) -> (f64, f64, f64) {
-        ALL_STATES.iter().fold((0.0, 0.0, 0.0), |(w, b1, b2), &(x1, x2)| {
-            let p = self.prob((x1, x2));
-            (w + p * x1 * x2, b1 + p * x1, b2 + p * x2)
-        })
-    }
-}
-
-/// Data averages (<x1 x2>, <x1>, <x2>) in a single pass.
-fn data_moments(data: &[State]) -> (f64, f64, f64) {
-    let n = data.len() as f64;
-    let (w, b1, b2) = data.iter().fold((0.0, 0.0, 0.0), |(w, b1, b2), &(x1, x2)| {
-        (w + x1 * x2, b1 + x1, b2 + x2)
-    });
-    (w / n, b1 / n, b2 / n)
-}
-
-/// Hebb rule, Eqs. (3)-(5): b1 = <x1>, b2 = <x2>, w = <x1 x2> over the data.
-fn hebb_boltzmann(data: &[State]) -> Boltzmann2 {
-    let (w, b1, b2) = data_moments(data);
-    Boltzmann2::new(w, b1, b2)
-}
-
-/// Hinton's rule, Eqs. (8)-(11): gradient ascent on -D_KL(P0 || P),
-/// dW = lr * (<x1 x2>_data - <x1 x2>_model), and likewise for b1, b2.
-/// Starts from W = b1 = b2 = 0, so with lr = 1 the first step is the Hebb rule.
-fn hinton_boltzmann(data: &[State], lr: f64, steps: usize) -> Boltzmann2 {
-    let (dw, db1, db2) = data_moments(data);
-    let mut m = Boltzmann2::new(0.0, 0.0, 0.0);
-    for _ in 0..steps {
-        let (mw, mb1, mb2) = m.moments();
-        m = Boltzmann2::new(m.w + lr * (dw - mw), m.b1 + lr * (db1 - mb1), m.b2 + lr * (db2 - mb2));
-    }
-    m
 }
 
 /// Fraction of data samples equal to state x.
@@ -150,12 +135,18 @@ fn empirical_prob(data: &[State], x: State) -> f64 {
     data.iter().filter(|&&d| d == x).count() as f64 / data.len() as f64
 }
 
-/// D_KL(P0 || P) = sum_x P0(x) ln(P0(x) / P(x)), skipping states absent from the data.
-fn kl_divergence(data: &[State], model: &Boltzmann2) -> f64 {
+/// D_KL(P0 || P) = sum_x P0(x) ln(P0(x) / P(x)) with P0 the empirical distribution,
+/// skipping states absent from the data.
+fn kl_divergence(data: &[State], model: &dyn SpinModel) -> f64 {
     ALL_STATES
         .iter()
         .map(|&x| (empirical_prob(data, x), model.prob(x)))
         .filter(|&(p0, _)| p0 > 0.0)
         .map(|(p0, p)| p0 * (p0 / p).ln())
         .sum()
+}
+
+/// D_KL(TARGET || P).
+fn kl_target(model: &dyn SpinModel) -> f64 {
+    ALL_STATES.iter().zip(TARGET).map(|(&x, t)| t * (t / model.prob(x)).ln()).sum()
 }
