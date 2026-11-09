@@ -128,10 +128,11 @@ Larger $k$ does not help at fixed $\eta$, while a smaller $\eta$ lowers every ro
 gradient noise from estimating the model term with 100 chains, not CD bias. With two visible spins one
 Gibbs step from the data is already close to equilibrium, so any CD-1 bias stays below about $10^{-4}$ here.
 CD bias matters in larger models where chains mix slowly.
+
 ## Run
 
+```bash
 cargo run --release              # sample, fit, print the tables, write data/energy_grid.parquet
-cargo run                        # sample, fit, print the tables, write data/energy_grid.parquet
 python3 scripts/plot_contour.py  # contour_energy.png / .pdf
 ```
 
