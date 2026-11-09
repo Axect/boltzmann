@@ -1,0 +1,7 @@
+[package]
+name = "boltzmann"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+peroxide = { version = "0.43.1", features = ["parquet"] }
